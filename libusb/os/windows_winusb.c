@@ -42,6 +42,8 @@
 		continue;			\
 	}
 
+#define IO_WAIT_TIME 1000
+
 // WinUSB-like API prototypes
 static bool winusbx_init(struct libusb_context *ctx);
 static void winusbx_exit(void);
@@ -703,10 +705,49 @@ static void winusb_exit(struct libusb_context *ctx)
 	exit_dlls();
 }
 
+static BOOL
+get_device_io_control_result(HANDLE handle, HANDLE io_event, BOOL close, LPOVERLAPPED op)
+{
+  DWORD error = GetLastError();
+
+  if (error != ERROR_IO_PENDING) {
+    CancelIo(handle);
+
+    if (close) CloseHandle(handle);
+
+    usbi_err(0, "error should be io pending");
+    return FALSE;
+  }
+
+  DWORD wret = WaitForSingleObject(io_event, IO_WAIT_TIME);
+  if (wret != WAIT_OBJECT_0) {
+    if (!CancelIo(handle)) {
+      usbi_err(0, "%s cancel failed %d", GetLastError());
+    }
+
+    if (close) CloseHandle(handle);
+
+    usbi_err(0, "wait failed %d %d", GetLastError, wret);
+    return FALSE;
+  } else {
+    DWORD bytes_written = 0;
+    BOOL res = GetOverlappedResult(handle, op, &bytes_written, TRUE /*wait*/);
+
+    if (!res) {
+      usbi_err(0, "get overlapped result failed %d", GetLastError());
+      CancelIo(handle);
+      if (close) CloseHandle(handle);
+      return FALSE;
+    }
+
+    return TRUE;
+  }
+}
+
 /*
  * fetch and cache all the config descriptors through I/O
  */
-static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle)
+static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle, HANDLE io_event)
 {
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
@@ -716,7 +757,7 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 	USB_CONFIGURATION_DESCRIPTOR_SHORT cd_buf_short; // dummy request
 	PUSB_DESCRIPTOR_REQUEST cd_buf_actual = NULL;    // actual request
 	PUSB_CONFIGURATION_DESCRIPTOR cd_data;
-
+	OVERLAPPED overlapped;
 	num_configurations = dev->device_descriptor.bNumConfigurations;
 	if (num_configurations == 0)
 		return;
@@ -748,10 +789,18 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 		// Dummy call to get the required data size. Initial failures are reported as info rather
 		// than error as they can occur for non-penalizing situations, such as with some hubs.
 		// coverity[tainted_data_argument]
+    
+		ResetEvent(io_event);
+		SecureZeroMemory(&overlapped, sizeof(overlapped));
+		overlapped.hEvent = io_event;
+
 		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &cd_buf_short, size,
-			&cd_buf_short, size, &ret_size, NULL)) {
-			usbi_info(ctx, "could not access configuration descriptor %u (dummy) for '%s': %s", i, priv->dev_id, windows_error_str(0));
-			continue;
+			&cd_buf_short, size, &ret_size, &overlapped)) {
+			if(!get_device_io_control_result(hub_handle,io_event, FALSE, &overlapped)){
+				usbi_info(ctx, "could not access configuration descriptor %u (dummy) for '%s': %s", i, priv->dev_id,
+                  windows_error_str(0));
+				continue;
+			}
 		}
 
 		if ((ret_size != size) || (cd_buf_short.desc.wTotalLength < sizeof(USB_CONFIGURATION_DESCRIPTOR))) {
@@ -773,11 +822,18 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 		cd_buf_actual->SetupPacket.wValue = (LIBUSB_DT_CONFIG << 8) | i;
 		cd_buf_actual->SetupPacket.wIndex = 0;
 		cd_buf_actual->SetupPacket.wLength = cd_buf_short.desc.wTotalLength;
-
+		
+		ResetEvent(io_event);
+		SecureZeroMemory(&overlapped, sizeof(overlapped));
+		overlapped.hEvent = io_event;
+		
 		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, cd_buf_actual, size,
-			cd_buf_actual, size, &ret_size, NULL)) {
-			usbi_err(ctx, "could not access configuration descriptor %u (actual) for '%s': %s", i, priv->dev_id, windows_error_str(0));
-			continue;
+			cd_buf_actual, size, &ret_size, &overlapped)) {
+			if(!get_device_io_control_result(hub_handle,io_event, FALSE, &overlapped)){
+				usbi_err(ctx, "could not access configuration descriptor %u (actual) for '%s': %s", i, priv->dev_id,
+                 windows_error_str(0));
+				continue;
+			}
 		}
 
 		cd_data = (PUSB_CONFIGURATION_DESCRIPTOR)((UCHAR *)cd_buf_actual + USB_DESCRIPTOR_REQUEST_SIZE);
@@ -890,22 +946,36 @@ static int init_root_hub(struct libusb_device *dev)
 	ULONG port_number, num_ports;
 	DWORD size;
 	int r;
+	OVERLAPPED overlapped;
+	HANDLE io_event;
+
+	io_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+  
+	if (!io_event || io_event == INVALID_HANDLE_VALUE) {
+		usbi_err(ctx, "create event failed");
+		return LIBUSB_ERROR_IO;
+	}
+	
+	ResetEvent(io_event);
+	SecureZeroMemory(&overlapped, sizeof(overlapped));
+	overlapped.hEvent = io_event;
 
 	// Determining the speed of a root hub is painful. Microsoft does not directly report the speed
 	// capabilities of the root hub itself, only its ports and/or connected devices. Therefore we
 	// are forced to query each individual port of the root hub to try and infer the root hub's
 	// speed. Note that we have to query all ports because the presence of a device on that port
 	// changes if/how Windows returns any useful speed information.
-	handle = CreateFileA(priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	handle = CreateFileA(priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		usbi_err(ctx, "could not open root hub %s: %s", priv->path, windows_error_str(0));
 		return LIBUSB_ERROR_ACCESS;
 	}
 
-	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &hub_info, sizeof(hub_info), &size, NULL)) {
-		usbi_warn(ctx, "could not get root hub info for '%s': %s", priv->dev_id, windows_error_str(0));
-		CloseHandle(handle);
-		return LIBUSB_ERROR_ACCESS;
+	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &hub_info, sizeof(hub_info), &size, &overlapped)) {
+		if (!get_device_io_control_result(handle, io_event, TRUE, &overlapped)) {
+			usbi_warn(ctx, "could not get root hub info for '%s': %s", priv->dev_id, windows_error_str(0));
+			return LIBUSB_ERROR_ACCESS;
+		}
 	}
 
 	num_ports = hub_info.u.HubInformation.HubDescriptor.bNumberOfPorts;
@@ -920,11 +990,17 @@ static int init_root_hub(struct libusb_device *dev)
 			conn_info_v2.ConnectionIndex = port_number;
 			conn_info_v2.Length = sizeof(conn_info_v2);
 			conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
+			ResetEvent(io_event);
+			SecureZeroMemory(&overlapped, sizeof(overlapped));
+			overlapped.hEvent = io_event;
+
 			if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
-				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
-				usbi_warn(ctx, "could not get node connection information (V2) for root hub '%s' port %lu: %s",
+				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, &overlapped)) {
+				if(!get_device_io_control_result(handle, io_event, FALSE, &overlapped)){
+					usbi_warn(ctx, "could not get node connection information (V2) for root hub '%s' port %lu: %s",
 					priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
-				break;
+					break;
+				}
 			}
 
 			if (conn_info_v2.Flags.DeviceIsSuperSpeedPlusCapableOrHigher)
@@ -960,11 +1036,16 @@ static int init_root_hub(struct libusb_device *dev)
 	// highest speed that the root hub supports will not give us the correct speed.
 	for (port_number = 1; port_number <= num_ports; port_number++) {
 		conn_info.ConnectionIndex = port_number;
+		ResetEvent(io_event);
+		SecureZeroMemory(&overlapped, sizeof(overlapped));
+		overlapped.hEvent = io_event;
 		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
-			&conn_info, sizeof(conn_info), &size, NULL)) {
-			usbi_warn(ctx, "could not get node connection information for root hub '%s' port %lu: %s",
-				priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
-			continue;
+			&conn_info, sizeof(conn_info), &size, &overlapped)) {
+			if(!get_device_io_control_result(handle, io_event, FALSE, &overlapped)){
+				usbi_warn(ctx, "could not get node connection information for root hub '%s' port %lu: %s", priv->dev_id,
+                  ULONG_CAST(port_number), windows_error_str(0));
+				break;
+			}
 		}
 
 		if (conn_info.ConnectionStatus != DeviceConnected)
@@ -978,6 +1059,7 @@ static int init_root_hub(struct libusb_device *dev)
 
 make_descriptors:
 	CloseHandle(handle);
+	CloseHandle(io_event);
 
 	dev->device_descriptor.bLength = LIBUSB_DT_DEVICE_SIZE;
 	dev->device_descriptor.bDescriptorType = LIBUSB_DT_DEVICE;
@@ -1054,6 +1136,15 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 	uint8_t bus_number, depth;
 	int r;
 	int ginfotimeout;
+	OVERLAPPED overlapped;
+	HANDLE io_event;
+
+	io_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+  
+	if (!io_event || io_event == INVALID_HANDLE_VALUE) {
+		usbi_err(ctx, "create event failed");
+		return LIBUSB_ERROR_IO;
+	}
 
 	priv = usbi_get_device_priv(dev);
 
@@ -1106,7 +1197,7 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		dev->parent_dev = parent_dev;
 		priv->depth = depth;
 
-		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 		if (hub_handle == INVALID_HANDLE_VALUE) {
 			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
 			return LIBUSB_ERROR_ACCESS;
@@ -1116,12 +1207,17 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		// coverity[tainted_data_argument]
 		ginfotimeout = 20;
 		do {
+			ResetEvent(io_event);
+			SecureZeroMemory(&overlapped, sizeof(overlapped));
+			overlapped.hEvent = io_event;
+
 			if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
-				&conn_info, sizeof(conn_info), &size, NULL)) {
-				usbi_warn(ctx, "could not get node connection information for device '%s': %s",
-					priv->dev_id, windows_error_str(0));
-				CloseHandle(hub_handle);
-				return LIBUSB_ERROR_NO_DEVICE;
+                           &conn_info, sizeof(conn_info), &size, &overlapped)) {
+				if(!get_device_io_control_result(hub_handle,io_event, TRUE, &overlapped)){
+					usbi_warn(ctx, "could not get node connection information for device '%s': %s", priv->dev_id,
+                    windows_error_str(0));
+					return LIBUSB_ERROR_NOT_FOUND;
+				}
 			}
 
 			if (conn_info.ConnectionStatus == NoDeviceConnected) {
@@ -1170,17 +1266,25 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		}
 
 		// Cache as many config descriptors as we can
-		cache_config_descriptors(dev, hub_handle);
+		cache_config_descriptors(dev, hub_handle,io_event);
 
 		// In their great wisdom, Microsoft decided to BREAK the USB speed report between Windows 7 and Windows 8
 		if (windows_version >= WINDOWS_8) {
 			conn_info_v2.ConnectionIndex = (ULONG)port_number;
 			conn_info_v2.Length = sizeof(USB_NODE_CONNECTION_INFORMATION_EX_V2);
 			conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
-			if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
-				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
-				usbi_warn(ctx, "could not get node connection information (V2) for device '%s': %s",
+			ResetEvent(io_event);
+			SecureZeroMemory(&overlapped, sizeof(overlapped));
+			overlapped.hEvent = io_event;
+
+			if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, &conn_info_v2,
+                           sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, &overlapped)) {
+				if(!get_device_io_control_result(hub_handle,io_event, TRUE, &overlapped)){
+					usbi_warn(ctx, "could not get node connection information (V2) for device '%s': %s",
 					priv->dev_id,  windows_error_str(0));
+					return LIBUSB_ERROR_NOT_FOUND;
+				}
+
 			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
 				conn_info.Speed = UsbSuperSpeedPlus;
 			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
@@ -1189,6 +1293,7 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		}
 
 		CloseHandle(hub_handle);
+		CloseHandle(io_event);
 
 		if (conn_info.DeviceAddress > UINT8_MAX)
 			usbi_err(ctx, "program assertion failed - device address overflow");
