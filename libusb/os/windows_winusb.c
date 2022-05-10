@@ -1282,13 +1282,12 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 				if(!get_device_io_control_result(hub_handle,io_event, TRUE, &overlapped)){
 					usbi_warn(ctx, "could not get node connection information (V2) for device '%s': %s",
 					priv->dev_id,  windows_error_str(0));
-					return LIBUSB_ERROR_NOT_FOUND;
+				}else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
+					conn_info.Speed = UsbSuperSpeedPlus;
 				}
-
-			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
-				conn_info.Speed = UsbSuperSpeedPlus;
-			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
-				conn_info.Speed = UsbSuperSpeed;
+				else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
+					conn_info.Speed = UsbSuperSpeed;
+				}
 			}
 		}
 
